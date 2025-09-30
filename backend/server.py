@@ -4,14 +4,17 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import bcrypt
+import jwt
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
 
 from ai_agents.agents import AgentConfig, ChatAgent, SearchAgent
@@ -24,6 +27,63 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).parent
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+security = HTTPBearer()
+
+
+# Auth Models
+class UserSignup(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    email: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+# Chat Models
+class ChatRoomCreate(BaseModel):
+    pass
+
+
+class ChatRoomResponse(BaseModel):
+    id: str
+    invite_token: str
+    participants: List[str]
+    created_at: datetime
+    is_active: bool
+    other_user: Optional[UserResponse] = None
+
+
+class JoinChatRequest(BaseModel):
+    invite_token: str
+
+
+class MessageCreate(BaseModel):
+    content: str
+
+
+class MessageResponse(BaseModel):
+    id: str
+    chat_id: str
+    sender_id: str
+    sender_username: str
+    content: str
+    created_at: datetime
 
 
 class StatusCheck(BaseModel):
@@ -93,6 +153,42 @@ async def _get_or_create_agent(request: Request, agent_type: str):
         raise HTTPException(status_code=400, detail=f"Unknown agent type '{agent_type}'")
 
     return cache[agent_type]
+
+
+# Auth utilities
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=30)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), request: Request = None):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+
+        db = _ensure_db(request)
+        user = await db.users.find_one({"_id": user_id})
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 @asynccontextmanager
@@ -234,6 +330,245 @@ async def get_agent_capabilities(request: Request):
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("Error getting capabilities")
         return {"success": False, "error": str(exc)}
+
+
+# Auth endpoints
+@api_router.post("/auth/signup", response_model=TokenResponse)
+async def signup(user_data: UserSignup, request: Request):
+    db = _ensure_db(request)
+
+    # Check if user exists
+    existing_user = await db.users.find_one({"$or": [{"email": user_data.email}, {"username": user_data.username}]})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User with this email or username already exists")
+
+    # Create user
+    user_id = str(uuid.uuid4())
+    hashed_pw = hash_password(user_data.password)
+
+    user = {
+        "_id": user_id,
+        "username": user_data.username,
+        "email": user_data.email,
+        "password": hashed_pw,
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    await db.users.insert_one(user)
+
+    # Create token
+    access_token = create_access_token({"sub": user_id})
+
+    return TokenResponse(
+        access_token=access_token,
+        user=UserResponse(id=user_id, username=user_data.username, email=user_data.email),
+    )
+
+
+@api_router.post("/auth/login", response_model=TokenResponse)
+async def login(login_data: UserLogin, request: Request):
+    db = _ensure_db(request)
+
+    user = await db.users.find_one({"email": login_data.email})
+    if not user or not verify_password(login_data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    access_token = create_access_token({"sub": user["_id"]})
+
+    return TokenResponse(
+        access_token=access_token,
+        user=UserResponse(id=user["_id"], username=user["username"], email=user["email"]),
+    )
+
+
+# Chat endpoints
+@api_router.post("/chats/create", response_model=ChatRoomResponse)
+async def create_chat_room(chat_data: ChatRoomCreate, request: Request, current_user: dict = Depends(get_current_user)):
+    db = _ensure_db(request)
+
+    chat_id = str(uuid.uuid4())
+    invite_token = str(uuid.uuid4())
+
+    chat_room = {
+        "_id": chat_id,
+        "invite_token": invite_token,
+        "participants": [current_user["_id"]],
+        "created_by": current_user["_id"],
+        "created_at": datetime.now(timezone.utc),
+        "is_active": True,
+    }
+
+    await db.chat_rooms.insert_one(chat_room)
+
+    return ChatRoomResponse(
+        id=chat_id,
+        invite_token=invite_token,
+        participants=[current_user["_id"]],
+        created_at=chat_room["created_at"],
+        is_active=True,
+    )
+
+
+@api_router.post("/chats/join/{invite_token}", response_model=ChatRoomResponse)
+async def join_chat_room(invite_token: str, request: Request, current_user: dict = Depends(get_current_user)):
+    db = _ensure_db(request)
+
+    chat_room = await db.chat_rooms.find_one({"invite_token": invite_token})
+    if not chat_room:
+        raise HTTPException(status_code=404, detail="Chat room not found")
+
+    if len(chat_room["participants"]) >= 2:
+        if current_user["_id"] in chat_room["participants"]:
+            # User already in chat
+            other_user_id = [p for p in chat_room["participants"] if p != current_user["_id"]][0]
+            other_user = await db.users.find_one({"_id": other_user_id})
+            other_user_data = (
+                UserResponse(id=other_user["_id"], username=other_user["username"], email=other_user["email"])
+                if other_user
+                else None
+            )
+
+            return ChatRoomResponse(
+                id=chat_room["_id"],
+                invite_token=chat_room["invite_token"],
+                participants=chat_room["participants"],
+                created_at=chat_room["created_at"],
+                is_active=chat_room["is_active"],
+                other_user=other_user_data,
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Chat room is full")
+
+    if current_user["_id"] in chat_room["participants"]:
+        raise HTTPException(status_code=400, detail="You are already in this chat room")
+
+    # Add user to chat
+    await db.chat_rooms.update_one({"_id": chat_room["_id"]}, {"$push": {"participants": current_user["_id"]}})
+
+    chat_room["participants"].append(current_user["_id"])
+
+    # Get other user details
+    other_user_id = [p for p in chat_room["participants"] if p != current_user["_id"]][0]
+    other_user = await db.users.find_one({"_id": other_user_id})
+    other_user_data = (
+        UserResponse(id=other_user["_id"], username=other_user["username"], email=other_user["email"])
+        if other_user
+        else None
+    )
+
+    return ChatRoomResponse(
+        id=chat_room["_id"],
+        invite_token=chat_room["invite_token"],
+        participants=chat_room["participants"],
+        created_at=chat_room["created_at"],
+        is_active=chat_room["is_active"],
+        other_user=other_user_data,
+    )
+
+
+@api_router.get("/chats/my-chats", response_model=List[ChatRoomResponse])
+async def get_my_chats(request: Request, current_user: dict = Depends(get_current_user)):
+    db = _ensure_db(request)
+
+    chat_rooms = await db.chat_rooms.find({"participants": current_user["_id"]}).to_list(1000)
+
+    result = []
+    for chat_room in chat_rooms:
+        other_user_data = None
+        if len(chat_room["participants"]) == 2:
+            other_user_id = [p for p in chat_room["participants"] if p != current_user["_id"]][0]
+            other_user = await db.users.find_one({"_id": other_user_id})
+            if other_user:
+                other_user_data = UserResponse(
+                    id=other_user["_id"], username=other_user["username"], email=other_user["email"]
+                )
+
+        result.append(
+            ChatRoomResponse(
+                id=chat_room["_id"],
+                invite_token=chat_room["invite_token"],
+                participants=chat_room["participants"],
+                created_at=chat_room["created_at"],
+                is_active=chat_room["is_active"],
+                other_user=other_user_data,
+            )
+        )
+
+    return result
+
+
+@api_router.post("/messages/{chat_id}", response_model=MessageResponse)
+async def send_message(
+    chat_id: str, message_data: MessageCreate, request: Request, current_user: dict = Depends(get_current_user)
+):
+    db = _ensure_db(request)
+
+    # Verify user is in chat
+    chat_room = await db.chat_rooms.find_one({"_id": chat_id})
+    if not chat_room:
+        raise HTTPException(status_code=404, detail="Chat room not found")
+
+    if current_user["_id"] not in chat_room["participants"]:
+        raise HTTPException(status_code=403, detail="You are not a participant in this chat")
+
+    message_id = str(uuid.uuid4())
+    message = {
+        "_id": message_id,
+        "chat_id": chat_id,
+        "sender_id": current_user["_id"],
+        "content": message_data.content,
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    await db.messages.insert_one(message)
+
+    return MessageResponse(
+        id=message_id,
+        chat_id=chat_id,
+        sender_id=current_user["_id"],
+        sender_username=current_user["username"],
+        content=message_data.content,
+        created_at=message["created_at"],
+    )
+
+
+@api_router.get("/messages/{chat_id}", response_model=List[MessageResponse])
+async def get_messages(
+    chat_id: str, request: Request, current_user: dict = Depends(get_current_user), limit: int = 100, before: str = None
+):
+    db = _ensure_db(request)
+
+    # Verify user is in chat
+    chat_room = await db.chat_rooms.find_one({"_id": chat_id})
+    if not chat_room:
+        raise HTTPException(status_code=404, detail="Chat room not found")
+
+    if current_user["_id"] not in chat_room["participants"]:
+        raise HTTPException(status_code=403, detail="You are not a participant in this chat")
+
+    # Build query
+    query = {"chat_id": chat_id}
+    if before:
+        query["created_at"] = {"$lt": datetime.fromisoformat(before.replace("Z", "+00:00"))}
+
+    messages = await db.messages.find(query).sort("created_at", -1).limit(limit).to_list(limit)
+
+    # Get sender usernames
+    result = []
+    for msg in reversed(messages):
+        sender = await db.users.find_one({"_id": msg["sender_id"]})
+        result.append(
+            MessageResponse(
+                id=msg["_id"],
+                chat_id=msg["chat_id"],
+                sender_id=msg["sender_id"],
+                sender_username=sender["username"] if sender else "Unknown",
+                content=msg["content"],
+                created_at=msg["created_at"],
+            )
+        )
+
+    return result
 
 
 app.include_router(api_router)
